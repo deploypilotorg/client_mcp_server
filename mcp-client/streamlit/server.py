@@ -8,7 +8,7 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict
 
-from mcp import Server, Tool, ToolExecution
+from mcp import Server, Tool, ToolExecution, stdio_server
 
 # Define tools
 class TimeToolHandler:
@@ -201,91 +201,89 @@ class GitHubRepoToolHandler:
 
 async def main():
     # Create server
-    server = Server()
+    server_instance = Server(name="github-repo-server")
     
-    # Register tools
-    server.register_tool(
-        Tool(
-            name="get_time",
-            description="Get the current time",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            },
-            handler=TimeToolHandler()
-        )
+    # Create the tools
+    time_tool = Tool(
+        name="get_time",
+        description="Get the current time",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+        handler=TimeToolHandler()
     )
     
-    server.register_tool(
-        Tool(
-            name="calculate",
-            description="Perform a simple calculation",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "The expression to calculate (e.g., 'add(3, 4)', 'subtract(5, 2)', 'multiply(3, 3)', 'divide(10, 2)')"
-                    }
+    calc_tool = Tool(
+        name="calculate",
+        description="Perform a simple calculation",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "The expression to calculate (e.g., 'add(3, 4)', 'subtract(5, 2)', 'multiply(3, 3)', 'divide(10, 2)')"
+                }
+            },
+            "required": ["expression"]
+        },
+        handler=CalcToolHandler()
+    )
+    
+    weather_tool = Tool(
+        name="get_weather",
+        description="Get weather information for a location",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The location to get weather for (e.g., 'New York', 'London', 'Tokyo', 'Sydney', 'Paris')"
+                }
+            },
+            "required": ["location"]
+        },
+        handler=WeatherToolHandler()
+    )
+    
+    github_tool = Tool(
+        name="github_repo",
+        description="Clone and interact with GitHub repositories",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "The action to perform (clone, list_files, read_file, get_repo_info)",
+                    "enum": ["clone", "list_files", "read_file", "get_repo_info"]
                 },
-                "required": ["expression"]
-            },
-            handler=CalcToolHandler()
-        )
-    )
-    
-    server.register_tool(
-        Tool(
-            name="get_weather",
-            description="Get weather information for a location",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "The location to get weather for (e.g., 'New York', 'London', 'Tokyo', 'Sydney', 'Paris')"
-                    }
+                "repo_url": {
+                    "type": "string",
+                    "description": "The URL of the GitHub repository (required for 'clone' action)"
                 },
-                "required": ["location"]
-            },
-            handler=WeatherToolHandler()
-        )
-    )
-    
-    server.register_tool(
-        Tool(
-            name="github_repo",
-            description="Clone and interact with GitHub repositories",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "The action to perform (clone, list_files, read_file, get_repo_info)",
-                        "enum": ["clone", "list_files", "read_file", "get_repo_info"]
-                    },
-                    "repo_url": {
-                        "type": "string",
-                        "description": "The URL of the GitHub repository (required for 'clone' action)"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "The path within the repository (for 'list_files' action)"
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to read (for 'read_file' action)"
-                    }
+                "path": {
+                    "type": "string",
+                    "description": "The path within the repository (for 'list_files' action)"
                 },
-                "required": ["action"]
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to read (for 'read_file' action)"
+                }
             },
-            handler=GitHubRepoToolHandler()
-        )
+            "required": ["action"]
+        },
+        handler=GitHubRepoToolHandler()
     )
     
-    # Start the server
-    await server.serve_stdio()
+    # Add tools to the server
+    server_instance.tools = [time_tool, calc_tool, weather_tool, github_tool]
+    
+    # Start the server using stdio transport
+    # stdio_server returns a context manager, so we need to use it with async with
+    async with stdio_server(server_instance) as server_transport:
+        # This will keep running until the server is stopped
+        await server_transport
 
 if __name__ == "__main__":
     asyncio.run(main()) 
