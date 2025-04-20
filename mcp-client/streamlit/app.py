@@ -12,6 +12,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 import time
+import json
 
 # Load environment variables from the .env file 
 load_dotenv(".env")
@@ -28,8 +29,6 @@ class MCPGitHubClient:
         self.server_process = None
         self.anthropic = Anthropic()
         self.queue = Queue()
-        self.client_session = None
-        self.exit_stack = None
         self.tools = []
         
     def start_server(self, server_path):
@@ -41,45 +40,82 @@ class MCPGitHubClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0
+                bufsize=1,  # Line buffered
+                text=True   # Text mode for easier handling
             )
             return True
         except Exception as e:
             st.error(f"Failed to start server: {str(e)}")
             return False
     
-    async def connect_to_server(self):
-        """Connect to the running MCP server"""
+    def connect_to_server(self):
+        """Connect to the running MCP server using direct protocol communication"""
         try:
-            self.exit_stack = AsyncExitStack()
+            if not self.server_process:
+                st.error("Server not started")
+                return []
             
-            # Create server parameters to connect to the running server
-            server_params = StdioServerParameters(
-                command=sys.executable,  # Use Python executable as command
-                args=[],
-                env=None,
-                stdin=self.server_process.stdin,
-                stdout=self.server_process.stdout
-            )
+            # Send initialize request
+            initialize_request = {"type": "initialize"}
+            self.server_process.stdin.write(json.dumps(initialize_request) + "\n")
+            self.server_process.stdin.flush()
             
-            # Connect to the server
-            stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-            self.stdio, self.write = stdio_transport
-            self.client_session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
-            await self.client_session.initialize()
+            # Read response with timeout
+            response_text = self._read_with_timeout(5)
+            if not response_text:
+                st.error("Failed to initialize: no response received")
+                return []
             
-            # List available tools
-            response = await self.client_session.list_tools()
-            self.tools = response.tools
+            # Parse the response
+            response = json.loads(response_text)
+            if response.get("type") != "initialize_result":
+                st.error(f"Failed to initialize: unexpected response type: {response.get('type')}")
+                return []
             
-            return [tool.name for tool in self.tools]
+            # Get tools
+            self.tools = response.get("tools", [])
+            
+            # Verify connectivity by listing tools
+            list_tools_request = {"type": "list_tools"}
+            self.server_process.stdin.write(json.dumps(list_tools_request) + "\n")
+            self.server_process.stdin.flush()
+            
+            # Read response
+            response_text = self._read_with_timeout(5)
+            if not response_text:
+                st.error("Failed to list tools: no response received")
+                return []
+            
+            # Parse the response
+            list_response = json.loads(response_text)
+            if list_response.get("type") != "list_tools_result":
+                st.error(f"Failed to list tools: unexpected response type: {list_response.get('type')}")
+                return []
+            
+            # Return tool names
+            return [tool.get("name") for tool in self.tools]
+            
         except Exception as e:
             st.error(f"Failed to connect to server: {str(e)}")
             return []
     
-    async def process_query(self, query: str, history: List[Dict]) -> Dict:
+    def _read_with_timeout(self, timeout):
+        """Read a line from the server stdout with a timeout."""
+        import select
+        
+        if not self.server_process:
+            return None
+        
+        readable, _, _ = select.select([self.server_process.stdout], [], [], timeout)
+        
+        if readable:
+            return self.server_process.stdout.readline().strip()
+        else:
+            return None
+    
+    def process_query(self, query: str, history: List[Dict]) -> Dict:
         """Process a query using Claude and available tools"""
-        if not self.client_session:
+        if not self.server_process:
             return {"text": "Error: Not connected to server"}
         
         messages = history + [
@@ -91,9 +127,9 @@ class MCPGitHubClient:
 
         available_tools = [
             {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.inputSchema
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "input_schema": tool.get("inputSchema")
             } for tool in self.tools
         ]
 
@@ -114,13 +150,31 @@ class MCPGitHubClient:
                 tool_name = content.name
                 tool_args = content.input
 
-                # Execute tool call
-                result = await self.client_session.call_tool(tool_name, tool_args)
+                # Execute tool call using direct protocol
+                execute_request = {
+                    "type": "execute_tool",
+                    "name": tool_name,
+                    "arguments": tool_args
+                }
+                
+                self.server_process.stdin.write(json.dumps(execute_request) + "\n")
+                self.server_process.stdin.flush()
+                
+                # Read response
+                response_text = self._read_with_timeout(10)  # Longer timeout for tool execution
+                if not response_text:
+                    tool_result = "Error: No response received from server"
+                else:
+                    try:
+                        result_response = json.loads(response_text)
+                        tool_result = result_response.get("content", "Error: No content in response")
+                    except json.JSONDecodeError:
+                        tool_result = f"Error: Invalid JSON response: {response_text}"
                 
                 tool_call = {
                     "name": tool_name,
                     "args": tool_args,
-                    "result": result.content
+                    "result": tool_result
                 }
                 full_response["tools_used"].append(tool_call)
                 
@@ -130,7 +184,7 @@ class MCPGitHubClient:
                     "content": [
                         {
                             "type": "tool_use",
-                            "tool_use_id": content.id,
+                            "id": content.id,
                             "name": tool_name,
                             "input": tool_args
                         }
@@ -142,8 +196,8 @@ class MCPGitHubClient:
                     "content": [
                         {
                             "type": "tool_result",
-                            "tool_call_id": content.id,
-                            "content": result.content
+                            "tool_use_id": content.id,
+                            "content": tool_result
                         }
                     ]
                 })
@@ -161,14 +215,14 @@ class MCPGitHubClient:
 
         return full_response
     
-    async def cleanup(self):
+    def cleanup(self):
         """Clean up resources"""
-        if self.exit_stack:
-            await self.exit_stack.aclose()
-        
         if self.server_process:
             self.server_process.terminate()
-            self.server_process.wait()
+            try:
+                self.server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server_process.kill()
 
 # Helper function to run async tasks
 def run_async(coro):
@@ -217,8 +271,8 @@ with st.sidebar:
             # Give the server a moment to initialize
             time.sleep(2)
             
-            # Connect to the server
-            tool_names = run_async(st.session_state.client.connect_to_server())
+            # Connect to the server using direct protocol
+            tool_names = st.session_state.client.connect_to_server()
             
             if tool_names:
                 st.session_state.connected = True
@@ -226,7 +280,7 @@ with st.sidebar:
                 st.success(f"Connected to server with tools: {', '.join(tool_names)}")
             else:
                 st.error("Failed to connect to the server")
-                run_async(st.session_state.client.cleanup())
+                st.session_state.client.cleanup()
                 st.session_state.client = None
 
     if st.session_state.connected:
@@ -250,10 +304,10 @@ else:
             if repo_url:
                 with st.spinner("Analyzing repository..."):
                     # Ask Claude to analyze the repository
-                    response = run_async(st.session_state.client.process_query(
+                    response = st.session_state.client.process_query(
                         f"Clone and analyze this GitHub repository: {repo_url}. Please list the files and provide a brief summary of what the repository contains.",
                         st.session_state.chat_history
-                    ))
+                    )
                     
                     st.session_state.messages.append({"role": "user", "content": f"Clone and analyze this GitHub repository: {repo_url}"})
                     st.session_state.messages.append({"role": "assistant", "content": response["text"]})
@@ -263,7 +317,7 @@ else:
                     
                     st.session_state.repo_cloned = True
                     st.session_state.repo_url = repo_url
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.error("Please enter a GitHub repository URL")
     else:
@@ -279,34 +333,24 @@ else:
         user_input = st.chat_input("Ask about the repository or request tasks (e.g., 'Create a deployment workflow for this code')")
         
         if user_input:
-            # Add user message to chat
+            # Add user message to chat history
             st.session_state.messages.append({"role": "user", "content": user_input})
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
             
-            # Display user message
-            with st.chat_message("user"):
-                st.markdown(user_input)
+            # Process user query
+            with st.spinner("Processing..."):
+                # Get response from Claude
+                response = st.session_state.client.process_query(
+                    user_input,
+                    st.session_state.chat_history
+                )
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": response["text"]})
+                st.session_state.chat_history.append({"role": "assistant", "content": response["text"]})
             
-            # Get response from Claude with tools
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        response = run_async(st.session_state.client.process_query(
-                            user_input,
-                            st.session_state.chat_history
-                        ))
-                        
-                        # Display assistant response
-                        st.markdown(response["text"])
-                        
-                        # Add assistant message to chat
-                        st.session_state.messages.append({"role": "assistant", "content": response["text"]})
-                        
-                        # Update chat history for Claude
-                        st.session_state.chat_history.append({"role": "user", "content": user_input})
-                        st.session_state.chat_history.append({"role": "assistant", "content": response["text"]})
-                        
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
+            # Rerun the app to display the new messages
+            st.rerun()
         
         # Reset button
         if st.button("Analyze a different repository"):
@@ -314,12 +358,12 @@ else:
             st.session_state.repo_url = ""
             st.session_state.messages = []
             st.session_state.chat_history = []
-            st.experimental_rerun()
+            st.rerun()
 
 # Handle cleanup when the session ends
 def cleanup():
     if st.session_state.client:
-        run_async(st.session_state.client.cleanup())
+        st.session_state.client.cleanup()
 
 # Register cleanup
 st.session_state.cleanup = cleanup

@@ -8,7 +8,14 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict
 
-from mcp import Server, Tool, ToolExecution, stdio_server
+# Fix imports to match current MCP package structure
+from mcp import Tool
+from mcp.server import Server
+
+# Define a ToolExecution class since it doesn't seem to be available in the current MCP version
+class ToolExecution:
+    def __init__(self, content: str):
+        self.content = content
 
 # Define tools
 class TimeToolHandler:
@@ -279,11 +286,102 @@ async def main():
     # Add tools to the server
     server_instance.tools = [time_tool, calc_tool, weather_tool, github_tool]
     
-    # Start the server using stdio transport
-    # stdio_server returns a context manager, so we need to use it with async with
-    async with stdio_server(server_instance) as server_transport:
-        # This will keep running until the server is stopped
-        await server_transport
+    # Implement a direct I/O approach that's compatible with the MCP protocol
+    reader = asyncio.StreamReader()
+    read_protocol = asyncio.StreamReaderProtocol(reader)
+    
+    # Get the event loop
+    loop = asyncio.get_event_loop()
+    
+    # Connect pipes
+    await loop.connect_read_pipe(lambda: read_protocol, sys.stdin)
+    write_transport, _ = await loop.connect_write_pipe(asyncio.Protocol, sys.stdout)
+    
+    while True:
+        try:
+            # Read a line of input (a JSON-encoded request)
+            line = await reader.readline()
+            if not line:
+                break
+                
+            # Decode and process the request
+            request = json.loads(line.decode('utf-8'))
+            
+            if request.get("type") == "initialize":
+                # Handle initialize request
+                response = {
+                    "type": "initialize_result",
+                    "supportedVersions": ["0.1.0"],
+                    "tools": [{
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": tool.inputSchema
+                    } for tool in server_instance.tools]
+                }
+                
+            elif request.get("type") == "list_tools":
+                # Handle list_tools request
+                response = {
+                    "type": "list_tools_result",
+                    "tools": [{
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": tool.inputSchema
+                    } for tool in server_instance.tools]
+                }
+                
+            elif request.get("type") == "execute_tool":
+                # Handle execute_tool request
+                tool_name = request.get("name")
+                tool_args = request.get("arguments", {})
+                
+                # Find the tool
+                tool = next((t for t in server_instance.tools if t.name == tool_name), None)
+                
+                if tool:
+                    # Execute the tool
+                    result = await tool.handler.execute(tool_args)
+                    response = {
+                        "type": "execute_tool_result",
+                        "content": result.content
+                    }
+                else:
+                    response = {
+                        "type": "error",
+                        "message": f"Tool '{tool_name}' not found"
+                    }
+            else:
+                # Unknown request type
+                response = {
+                    "type": "error",
+                    "message": f"Unknown request type: {request.get('type')}"
+                }
+            
+            # Send response - write directly to transport to avoid drain_helper issue
+            response_json = json.dumps(response).encode('utf-8') + b'\n'
+            write_transport.write(response_json)
+                
+        except asyncio.CancelledError:
+            # Handle cancellation
+            break
+        except json.JSONDecodeError as e:
+            # Handle JSON decode error
+            error_msg = json.dumps({
+                "type": "error",
+                "message": f"Invalid JSON: {str(e)}"
+            }).encode('utf-8') + b'\n'
+            write_transport.write(error_msg)
+        except Exception as e:
+            # Handle other errors
+            error_msg = json.dumps({
+                "type": "error",
+                "message": f"Server error: {str(e)}"
+            }).encode('utf-8') + b'\n'
+            write_transport.write(error_msg)
+    
+    # Clean up
+    if write_transport:
+        write_transport.close()
 
 if __name__ == "__main__":
     asyncio.run(main()) 
