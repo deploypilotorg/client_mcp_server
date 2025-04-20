@@ -41,7 +41,7 @@ A tool that uses the MCP (Model Control Protocol) to connect Claude with GitHub 
    streamlit run app.py
    ```
 
-2. In the sidebar, connect to the MCP server by entering `server.py` in the "Server Script Path" field and clicking "Connect to Server".
+2. In the sidebar, connect to the MCP server by entering the path to the `server.py` file in the "Server Script Path" field and clicking "Connect to Server".
 
 3. Enter a GitHub repository URL (e.g., `https://github.com/deploypilotorg/example-repo`) and click "Analyze Repository".
 
